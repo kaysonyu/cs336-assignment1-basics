@@ -3,6 +3,7 @@ from typing import BinaryIO
 import regex as re
 from collections import Counter
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 
 def find_chunk_boundaries(file: BinaryIO, desired_num_chunks: int, split_special_token: bytes) -> list[int]:
@@ -52,6 +53,26 @@ def word_to_bytes(word: str) -> tuple[bytes, ...]:
     return tuple(bytes([i]) for i in word.encode(encoding="utf-8"))
 
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+def process_chunk(input_path, start, end, special_tokens):
+    word_counter = Counter()
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk_data = f.read(end - start).decode("utf-8")
+
+    # Removing special tokens before pre-tokenization
+    split_chunks = re.split("|".join(map(re.escape, special_tokens)), chunk_data)
+    for split_chunk in split_chunks:
+        for word_match in re.finditer(PAT, split_chunk):
+            word = word_match.group(0)
+            word_counter[word_to_bytes(word)] += 1
+
+    return word_counter
+
+
 def train_bpe(
     input_path: str, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -63,21 +84,15 @@ def train_bpe(
             vocab[len(vocab)] = b_token
 
     # step 2: Pre-tokenization
-    with open(input_path, encoding="utf-8") as f:
-        text = f.read()
+    with open(input_path, "rb") as f:
+        chunk_boundaries = find_chunk_boundaries(f, 4, split_special_token=b"<|endoftext|>")
 
-    # Removing special tokens before pre-tokenization
-    split_chunks = re.split("|".join(map(re.escape, special_tokens)), text)
-
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-    # record all words
+    chunks = [(chunk_boundaries[i], chunk_boundaries[i + 1]) for i in range(len(chunk_boundaries) - 1)]
     word_counter = Counter()
-
-    for split_chunk in tqdm(split_chunks, desc="pre-tokenization"):
-        for word_match in re.finditer(PAT, split_chunk):
-            word = word_match.group(0)
-            word_counter[word_to_bytes(word)] += 1
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(process_chunk, input_path, start, end, special_tokens) for start, end in chunks]
+        for future in futures:
+            word_counter.update(future.result())
 
     # step 3: Compute BPE merges
     merges = []
@@ -123,5 +138,9 @@ def train_bpe(
 
     return vocab, merges
 
-
-vocab, merges = train_bpe("data/TinyStoriesV2-GPT4-valid.txt", 1000, special_tokens=["<|endoftext|>"])
+if __name__ == "__main__":
+    from time import time
+    st = time()
+    vocab, merges = train_bpe("data/TinyStoriesV2-GPT4-valid.txt", 1000, special_tokens=["<|endoftext|>"])
+    end = time()
+    print(end-st)
